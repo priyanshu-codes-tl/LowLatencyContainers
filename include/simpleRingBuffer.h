@@ -14,7 +14,7 @@ class simpleRingBuffer {
 
     public:
 
-    void push(T data) {
+    void push(const T &data) {                          //improvement: was passing by value changed to pass by const reference
         m_buffer[m_writer_ptr] = data;                  //Drop data into current slot
         m_writer_ptr = (m_writer_ptr + 1) % SIZE;       //Moving ptr with wrap-around
     }
