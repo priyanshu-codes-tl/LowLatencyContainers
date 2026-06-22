@@ -1,4 +1,4 @@
-# Low-Latency HFT Pipeline Studio
+# Low-Latency HFT Pipeline Project
 
 A high-performance, ultra-low-latency engineering sandbox designed to simulate core components of a High-Frequency Trading (HFT) execution engine.
 
@@ -6,7 +6,7 @@ A high-performance, ultra-low-latency engineering sandbox designed to simulate c
 
 ## 🏗️ Architecture Modules
 
-As this studio grows, core performance blocks are organized below:
+As this project grows, core performance blocks are organized below:
 
 ### 1. Single-Producer Single-Consumer (SPSC) Ring Buffer
 * **Status:** Complete 🏁
