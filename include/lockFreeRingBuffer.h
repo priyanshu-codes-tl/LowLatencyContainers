@@ -2,9 +2,10 @@
 #define LOCKFREERINGBUFFER_H
 
 #include <iostream>
+#include <cstddef>
 #include <atomic>
 
-template<typename T, size_t N>
+template<typename T, std::size_t N>
 class lockFreeRingBuffer {
     //Force the size N to be a power of 2 at compile-time!
     static_assert((N & (N - 1)) == 0, "Buffer size MUST be a power of 2!");
@@ -14,10 +15,10 @@ class lockFreeRingBuffer {
     alignas(64) T m_buffer[N];
     
     //Push write and read pointer to its own private cache line
-    alignas(64) std::atomic<size_t> m_write_ptr{0};
-    alignas(64) std::atomic<size_t> m_read_ptr{0};
+    alignas(64) std::atomic<std::size_t> m_write_ptr{0};
+    alignas(64) std::atomic<std::size_t> m_read_ptr{0};
 
-    static constexpr size_t MASK = N - 1;
+    static constexpr std::size_t MASK = N - 1;
 
     public:
     //Constructor controller
@@ -27,8 +28,8 @@ class lockFreeRingBuffer {
 
 
     [[nodiscard]] bool push (const T &data) noexcept {
-        size_t current_write = m_write_ptr.load(std::memory_order_relaxed);
-        size_t current_read = m_read_ptr.load(std::memory_order_acquire);        //Acquire read ptr state
+        std::size_t current_write = m_write_ptr.load(std::memory_order_relaxed);
+        std::size_t current_read = m_read_ptr.load(std::memory_order_acquire);        //Acquire read ptr state
 
         if (current_write - current_read >= N) [[unlikely]] {
             return false;
@@ -43,8 +44,8 @@ class lockFreeRingBuffer {
     }
 
     [[nodiscard]] bool pop(T &data_out) noexcept {
-        size_t current_read = m_read_ptr.load(std::memory_order_relaxed);
-        size_t current_write = m_write_ptr.load(std::memory_order_acquire);     //Acquire write ptr state
+        std::size_t current_read = m_read_ptr.load(std::memory_order_relaxed);
+        std::size_t current_write = m_write_ptr.load(std::memory_order_acquire);     //Acquire write ptr state
         
         if (current_read == current_write) [[unlikely]] {
             return false;

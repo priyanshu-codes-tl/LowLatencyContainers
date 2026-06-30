@@ -9,5 +9,5 @@ include_directories(include)
 
 # Compile both your main code and your class logic together
 add_executable(LowLatencyContainers
-    src/main.cpp
+    src/test_pool.cpp
 )

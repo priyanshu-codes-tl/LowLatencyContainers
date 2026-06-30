@@ -27,10 +27,4 @@ class simpleRingBuffer {
 
 };
 
-struct marketUpdate {
-    double price;
-    int quantity;
-    char action;
-};
-
 #endif

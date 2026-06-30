@@ -5,6 +5,12 @@
 
 volatile double compiler_escape_hatch = 0.0;
 
+struct marketUpdate {
+    double price;
+    int quantity;
+    char action;
+};
+
 int main() {
     simpleRingBuffer<marketUpdate, 1024> networkQueue;
     marketUpdate incoming_packet {2704.20, 100, 'S'};
