@@ -14,7 +14,7 @@ As this project grows, core performance blocks are organized below:
 * **Math Hack:** Leverages bitwise `AND` masks (`&`) for instant $O(1)$ index wrapping, completely eliminating CPU-intensive division instructions.
 
 ### 2. Custom Fixed-Size Memory Pool
-* **Status:** In Progress 🛠️
+* **Status:** In Progress 🛠️  -->  Complete 🏁
 * **Core Optimization:** Bypassing `malloc` and the OS heap entirely to guarantee predictable $O(1)$ allocation times without runtime latency spikes.
 
 ---
