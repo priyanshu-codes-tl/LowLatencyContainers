@@ -35,15 +35,19 @@ class fixedSizeMemoryPool {
     template <typename... Args>
     [[nodiscard]] T* allocate(Args&&... args) noexcept {
         
-        node* allocate_node = m_free_spot.load(std::memory_order_relaxed);
+        node* current_spot = m_free_spot.load(std::memory_order_relaxed);
 
-        if(allocate_node == nullptr) [[unlikely]] {
+        if(current_spot == nullptr) [[unlikely]] {
             return nullptr;
         }
         
-        m_free_spot.store(allocate_node->next, std::memory_order_release);
+        while (current_spot != nullptr && !m_free_spot.compare_exchange_weak(current_spot, current_spot->next, std::memory_order_release, std::memory_order_relaxed)) {};
 
-        T* object_ptr = reinterpret_cast<T*>(allocate_node->data);
+        if(current_spot == nullptr) [[unlikely]] {
+            return nullptr;
+        }
+
+        T* object_ptr = reinterpret_cast<T*>(current_spot->data);
         
         ::new (static_cast<void*>(object_ptr)) T(std::forward<Args>(args)...);
 
@@ -59,9 +63,11 @@ class fixedSizeMemoryPool {
 
         node* returning_node = reinterpret_cast<node*>(ptr);
 
-        returning_node->next = m_free_spot.load(std::memory_order_relaxed);
+        node* current_spot = m_free_spot.load(std::memory_order_relaxed);
 
-        m_free_spot.store(returning_node, std::memory_order_release);
+        do {
+            returning_node->next = current_spot;
+        } while (!m_free_spot.compare_exchange_weak(current_spot, returning_node, std::memory_order_release, std::memory_order_relaxed));
 
         
     }
