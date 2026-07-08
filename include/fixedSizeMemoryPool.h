@@ -43,6 +43,7 @@ class fixedSizeMemoryPool {
         
         while (current_spot != nullptr && !m_free_spot.compare_exchange_weak(current_spot, current_spot->next, std::memory_order_release, std::memory_order_relaxed)) {};
 
+        // Safeguard check: If the loop exited because the pool became empty, exit safely!
         if(current_spot == nullptr) [[unlikely]] {
             return nullptr;
         }

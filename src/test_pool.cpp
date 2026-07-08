@@ -69,7 +69,7 @@ int main() {
     std::cout << "  -> PASS: Slot successfully recycled, destructed, and reallocated." << std::endl;
 
     std::cout << "\n=================================================" << std::endl;
-    std::cout << "🔥 ALL TESTS PASSED SUCCESSFULLY! 🔥" << std::endl;
+    std::cout << "------ALL TESTS PASSED SUCCESSFULLY!------" << std::endl;
     std::cout << "=================================================" << std::endl;
 
     return 0;
