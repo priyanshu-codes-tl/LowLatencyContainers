@@ -1,15 +1,19 @@
 #include "lockFreeRingBuffer.h"
 #include "fixedSizeMemoryPool.h"
 
+#include <iostream>
 #include <atomic>
 #include <cstring>
 #include <cstdint>
+#include <string_view>
 #include <thread>
 #include <array>
 #include <span>
 #include <chrono>
+#include <pthread.h>
 
 std::atomic<bool> is_running {true};
+std::atomic<bool> start_streaming {false};
 
 #pragma pack(push, 1)
 struct marketUpdate {
@@ -48,46 +52,33 @@ void handle_incoming_network_bytes (std::span<const char> rawNetworkBuffer) noex
     marketUpdate_aligned update(net_pkt->symbol, net_pkt->price, net_pkt->quantity, net_pkt->side);
 
     while (!transport_ring.push(update)) {
-        std::this_thread::yield();
+        asm volatile("pause" ::: "memory");
     }
 }
 
-// ---The Strategy Consumer---
-void run_strategy_consumer () noexcept {
-    marketUpdate_aligned localPacket;
+void run_network_producer_loop() noexcept {
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
 
-    while (is_running.load(std::memory_order_relaxed)) {
+    int target_core = 4;
+    CPU_SET(target_core, &cpuset);
 
-        if(transport_ring.pop(localPacket)) {
-            
-            if (localPacket.side == 'B' && localPacket.price > 25500) {
-                marketUpdate_aligned* savedSignal = execution_vault.allocate(localPacket.symbol, localPacket.price, localPacket.quantity, localPacket.side);
+    pthread_t current_thread = pthread_self();
 
-                if (savedSignal != nullptr) {
-                    std::cout << "[STRATEGY MATCH] Vaulted Signal for " << savedSignal->symbol.data() 
-                              << " | Price: " << savedSignal->price 
-                              << " | Qty: " << savedSignal->quantity << "\n";
-                }
-            }
+    int result = pthread_setaffinity_np(current_thread, sizeof(cpu_set_t), &cpuset);
 
-        }
-        else {
-            std::this_thread::yield();
-        }
+    if (result != 0) {
+        std::cerr << "Failed to pin network producer thread to CPU " << target_core << "\n";
+    } else {
+        std::cout << "Network Producer thread hard-locked to CPU " << target_core << "\n";
     }
-    
-    std::cout << "===---Strategy Consumer thread shut down cleanly.---===\n";
-}
-
-int main() {
-
-    std::cout << "====----Launching HFT Pipeline Sandbox Simulation---====\n";
-
-    //Start the Strategy Consumer thread background worker loop
-    std::thread consumer_thread(run_strategy_consumer);
 
     //Allocate a raw C-style buffer to act as our virtual incoming network interface card
     char mock_socket_buffer[sizeof(marketUpdate)];
+
+    while (!start_streaming.load(std::memory_order_acquire)) {
+        asm volatile ("pause" ::: "memory");
+    }
 
     std::cout << "===---Blasting 5 test ticks into the span boundary...---===\n";
     for (std::size_t i = 0; i < 5; ++i) {
@@ -103,17 +94,79 @@ int main() {
 
         handle_incoming_network_bytes(mock_socket_buffer);
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
-
     }
 
-    // Give the consumer thread an extra moment to process outstanding items in the buffer
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+}
+
+// ---The Strategy Consumer---
+void run_strategy_consumer () noexcept {
+    
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);      //Clear all CPU from the configuration mask
+
+    int target_core = 2;
+    CPU_SET(target_core, &cpuset);
+
+    pthread_t current_thread = pthread_self();
+
+    int result = pthread_setaffinity_np(current_thread, sizeof(cpu_set_t), &cpuset);
+
+    if (result != 0) {
+        std::cerr << "Failed to pin Strategy Consumer to CPU " << target_core << "\n";
+    } else {
+        std::cout << "Strategy Consumer thread hard-locked to CPU " << target_core << "\n";
+    }
+    
+    marketUpdate_aligned localPacket;
+
+    while (is_running.load(std::memory_order_relaxed) || !transport_ring.is_empty()) {
+
+        if(transport_ring.pop(localPacket)) {
+            
+            if (localPacket.side == 'B' && localPacket.price > 25500) {
+                marketUpdate_aligned* savedSignal = execution_vault.allocate(localPacket.symbol, localPacket.price, localPacket.quantity, localPacket.side);
+
+                if (savedSignal != nullptr) {
+                    std::cout << "[STRATEGY MATCH] Vaulted Signal for " 
+                              << std::string_view(savedSignal->symbol.data(), savedSignal->symbol.size()) 
+                              << " | Price: " << savedSignal->price 
+                              << " | Qty: " << savedSignal->quantity << "\n";
+                }
+            }
+
+        }
+        else {
+            asm volatile ("pause" ::: "memory");
+        }
+    }
+    
+    std::cout << "===---Strategy Consumer thread shut down cleanly.---===\n";
+}
+
+int main() {
+
+    std::cout << "====----Launching HFT Pipeline Sandbox Simulation---====\n";
+
+    //Start the Strategy Consumer thread background worker loop
+    std::thread consumer_thread(run_strategy_consumer);
+
+    ////Start the network producer thread background worker loop
+    std::thread producer_thread(run_network_producer_loop);
+
+    // Give the consumer a brief moment to finish its OS scheduling setup
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+    start_streaming.store(true, std::memory_order_release);
+
+    // Give the producer time to complete its 5-tick simulation blast
+    producer_thread.join();
+
 
     //ShutDown Sequence
     std::cout << "===Stopping background worker loops...===\n";
     is_running.store(false, std::memory_order_relaxed);
     consumer_thread.join();
+
     std::cout << "===---Pipeline simulation completed successfully!---===\n";
     return 0;
 

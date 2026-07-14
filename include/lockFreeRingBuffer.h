@@ -55,6 +55,10 @@ class lockFreeRingBuffer {
         m_read_ptr.store(current_read + 1, std::memory_order_release);
         return true;
     }
+
+    [[nodiscard]] bool is_empty() const noexcept {
+        return m_read_ptr.load(std::memory_order_relaxed) == m_write_ptr.load(std::memory_order_relaxed);
+    }
 };
 
 
