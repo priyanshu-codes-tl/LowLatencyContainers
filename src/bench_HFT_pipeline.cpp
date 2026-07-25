@@ -47,32 +47,53 @@ void run_network_producer() noexcept {
 
     pin_thread(4, "producer thread");
 
-    market_update_aligned network_packet{{"NIFTY50"}, 25580, 2000, 'B'};
+    constexpr std::size_t batch_size = 8;
+
+    market_update_aligned network_batch_packets[batch_size];
+
+    for (std::size_t i = 0; i < batch_size; ++i) {
+        network_batch_packets[i]= {{"NIFTY50"}, 25580, 2000, 'B'};
+    }
 
     while (hold.load(std::memory_order_relaxed)) {
         asm volatile ("pause" ::: "memory");
     }
-    
-    for (size_t i = 0; i < total_operations; ++i) {
-        while (!transport_ring.push(network_packet)) {
+
+    std::size_t total_pushed = 0;
+    while (total_pushed < total_operations) {
+    // Safety check to ensure we don't accidentally push 10,000,004 
+        // if the total_operations isn't perfectly divisible by 8
+        size_t remaining = total_operations - total_pushed;
+        size_t current_batch_size = (remaining < batch_size) ? remaining : batch_size;
+        std::size_t pushed_count = transport_ring.push_batch(network_batch_packets, current_batch_size);
+
+        if(pushed_count == 0) {
             asm volatile ("pause" ::: "memory");
+        } else {
+            total_pushed += pushed_count;
         }
     }
-    
 }
 
 void run_consumer_strategy() noexcept {
     pin_thread(2, "consumer thread");
 
-    market_update_aligned local_packet;
+    constexpr std::size_t batch_size = 8;
+    market_update_aligned local_packet[batch_size];
 
     while (market_open.load(std::memory_order_relaxed) || !transport_ring.is_empty()) {
         
-        if (transport_ring.pop(local_packet)) {
+        std::size_t popped_count = transport_ring.pop_batch(local_packet, batch_size);
+        if (popped_count > 0) {
 
-            if (local_packet.price > 25500 && local_packet.side == 'B') {
-                market_update_aligned* saved_signal = execution_vault.allocate(local_packet.symbol, local_packet.price, local_packet.quantity, local_packet.side);
-            }
+            for (std::size_t i=0; i<popped_count; ++i) {
+                if (local_packet[i].price > 25500 && local_packet[i].side == 'B') {
+                    market_update_aligned* saved_signal = execution_vault.allocate(local_packet[i].symbol, 
+                                                                                    local_packet[i].price, 
+                                                                                    local_packet[i].quantity, 
+                                                                                    local_packet[i].side);
+                }
+             }
 
         }
 

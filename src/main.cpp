@@ -12,8 +12,8 @@
 #include <chrono>
 #include <pthread.h>
 
-std::atomic<bool> is_running {true};
-std::atomic<bool> start_streaming {false};
+alignas(64) std::atomic<bool> market_open{true};
+alignas(64) std::atomic<bool> hold{true};
 
 #pragma pack(push, 1)
 struct marketUpdate {
@@ -38,53 +38,59 @@ struct marketUpdate_aligned {
 //Ring Buffer
 lockFreeRingBuffer <marketUpdate_aligned, 512> transport_ring;
 //Memory Pool
-fixedSizeMemoryPool <marketUpdate_aligned, 10000> execution_vault;
+fixedSizeMemoryPool <marketUpdate_aligned, 11000> execution_vault;
+
+//For pinning thread to cpu core
+void pin_thread (int core, std::string thread_name) noexcept {
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+
+    CPU_SET(core, &cpuset);
+
+    pthread_t current_thread = pthread_self();
+
+    if(pthread_setaffinity_np(current_thread, sizeof(cpu_set_t), &cpuset)){
+        std::cerr << "Failed to pin " << thread_name << " to core " << core << "\n";
+    }
+
+    else {
+        std::cout << thread_name << " is succesfully locked to core " << core << "\n";
+    }
+}
 
 // ---The Network Producer---
-void handle_incoming_network_bytes (std::span<const char> rawNetworkBuffer) noexcept{
+marketUpdate_aligned handle_incoming_network_bytes (std::span<const char> rawNetworkBuffer) noexcept{
 
     if (rawNetworkBuffer.size() < sizeof(marketUpdate)) [[unlikely]] {
-        return;
+        return {};
     }
 
     const auto* net_pkt = reinterpret_cast<const marketUpdate*>(rawNetworkBuffer.data());
 
     marketUpdate_aligned update(net_pkt->symbol, net_pkt->price, net_pkt->quantity, net_pkt->side);
 
-    while (!transport_ring.push(update)) {
-        asm volatile("pause" ::: "memory");
-    }
+    return update;    
 }
 
-void run_network_producer_loop() noexcept {
-    cpu_set_t cpuset;
-    CPU_ZERO(&cpuset);
+void run_network_producer() noexcept {
+    pin_thread(4, "producer thread");
 
-    int target_core = 4;
-    CPU_SET(target_core, &cpuset);
-
-    pthread_t current_thread = pthread_self();
-
-    int result = pthread_setaffinity_np(current_thread, sizeof(cpu_set_t), &cpuset);
-
-    if (result != 0) {
-        std::cerr << "Failed to pin network producer thread to CPU " << target_core << "\n";
-    } else {
-        std::cout << "Network Producer thread hard-locked to CPU " << target_core << "\n";
-    }
+    constexpr std::size_t batch_size = 8;
 
     //Allocate a raw C-style buffer to act as our virtual incoming network interface card
     char mock_socket_buffer[sizeof(marketUpdate)];
 
-    while (!start_streaming.load(std::memory_order_acquire)) {
+    marketUpdate_aligned network_batch_packets[batch_size];
+
+    while (market_open.load(std::memory_order_relaxed)) {
         asm volatile ("pause" ::: "memory");
     }
 
-    std::cout << "===---Blasting 5 test ticks into the span boundary...---===\n";
-    for (std::size_t i = 0; i < 5; ++i) {
+    std::cout << "===---Blasting 8 test ticks into the span boundary...---===\n";
+    for (std::size_t i = 0; i < 8; ++i) {
         
         uint32_t price = 25000 + (i*200);
-        uint32_t quantity = 100 + (i*100);
+        uint32_t quantity = 100 + (i*1000);
         char side = (i % 2 == 0) ? 'B' : 'S';
 
         std::memcpy (&mock_socket_buffer[0], "NIFTY50\0", 8);
@@ -92,39 +98,30 @@ void run_network_producer_loop() noexcept {
         std::memcpy (&mock_socket_buffer[12], &quantity, 4);
         std::memcpy (&mock_socket_buffer[16], &side, 1);
 
-        handle_incoming_network_bytes(mock_socket_buffer);
+        network_batch_packets[i] = handle_incoming_network_bytes(mock_socket_buffer);
 
     }
+
+    std::size_t pushed_count = transport_ring.push_batch(network_batch_packets, batch_size);
 
 }
 
 // ---The Strategy Consumer---
 void run_strategy_consumer () noexcept {
+    pin_thread(2, "consumer thread");
     
-    cpu_set_t cpuset;
-    CPU_ZERO(&cpuset);      //Clear all CPU from the configuration mask
+    constexpr std::size_t batch_size = 8;
+    marketUpdate_aligned local_batch_packet[batch_size];
 
-    int target_core = 2;
-    CPU_SET(target_core, &cpuset);
-
-    pthread_t current_thread = pthread_self();
-
-    int result = pthread_setaffinity_np(current_thread, sizeof(cpu_set_t), &cpuset);
-
-    if (result != 0) {
-        std::cerr << "Failed to pin Strategy Consumer to CPU " << target_core << "\n";
-    } else {
-        std::cout << "Strategy Consumer thread hard-locked to CPU " << target_core << "\n";
-    }
-    
-    marketUpdate_aligned localPacket;
-
-    while (is_running.load(std::memory_order_relaxed) || !transport_ring.is_empty()) {
-
-        if(transport_ring.pop(localPacket)) {
-            
-            if (localPacket.side == 'B' && localPacket.price > 25500) {
-                marketUpdate_aligned* savedSignal = execution_vault.allocate(localPacket.symbol, localPacket.price, localPacket.quantity, localPacket.side);
+    while (market_open.load(std::memory_order_relaxed) || !transport_ring.is_empty()) {
+        std::size_t popped_count = transport_ring.pop_batch(local_batch_packet, batch_size);
+        if(popped_count > 0) {
+            for (std::size_t i=0; i<popped_count; ++i) {
+            if (local_batch_packet[i].side == 'B' && local_batch_packet[i].price > 25500) {
+                marketUpdate_aligned* savedSignal = execution_vault.allocate(local_batch_packet[i].symbol, 
+                                                                             local_batch_packet[i].price, 
+                                                                             local_batch_packet[i].quantity, 
+                                                                             local_batch_packet[i].side);
 
                 if (savedSignal != nullptr) {
                     std::cout << "[STRATEGY MATCH] Vaulted Signal for " 
@@ -133,6 +130,7 @@ void run_strategy_consumer () noexcept {
                               << " | Qty: " << savedSignal->quantity << "\n";
                 }
             }
+        }
 
         }
         else {
@@ -151,20 +149,20 @@ int main() {
     std::thread consumer_thread(run_strategy_consumer);
 
     ////Start the network producer thread background worker loop
-    std::thread producer_thread(run_network_producer_loop);
+    std::thread producer_thread(run_network_producer);
 
     // Give the consumer a brief moment to finish its OS scheduling setup
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
-    start_streaming.store(true, std::memory_order_release);
+    hold.store(false, std::memory_order_release);
 
-    // Give the producer time to complete its 5-tick simulation blast
     producer_thread.join();
-
-
+    
     //ShutDown Sequence
-    std::cout << "===Stopping background worker loops...===\n";
-    is_running.store(false, std::memory_order_relaxed);
+    std::cout << "===Stopping background consumer worker loops...===\n";
+
+    market_open.store(false, std::memory_order_relaxed);
+
     consumer_thread.join();
 
     std::cout << "===---Pipeline simulation completed successfully!---===\n";

@@ -27,33 +27,41 @@ class lockFreeRingBuffer {
     lockFreeRingBuffer& operator= (const lockFreeRingBuffer&) = delete;
 
 
-    [[nodiscard]] bool push (const T &data) noexcept {
+    [[nodiscard]] std::size_t push_batch (const T* data_array, std::size_t count) noexcept {
         std::size_t current_write = m_write_ptr.load(std::memory_order_relaxed);
-        std::size_t current_read = m_read_ptr.load(std::memory_order_acquire);        //Acquire read ptr state
+        std::size_t current_read = m_read_ptr.load(std::memory_order_acquire);        
 
-        if (current_write - current_read >= N) [[unlikely]] {
-            return false;
+        std::size_t available = N - (current_write - current_read);
+
+        std::size_t items_to_push = (count < available) ? count : available;
+
+        if (items_to_push == 0) [[unlikely]] return 0;
+
+        for (std::size_t i = 0; i < items_to_push; ++i) {
+            m_buffer[(current_write + i) & MASK] = data_array[i];
         }
-
-        //Drop data using bitwise AND for instant wrap arround math
-        m_buffer[current_write & MASK] = data;
-        //Release the data for read pointer
-        m_write_ptr.store(current_write + 1, std::memory_order_release);
         
-        return true;
+        m_write_ptr.store(current_write + items_to_push, std::memory_order_release);
+        
+        return items_to_push;
     }
 
-    [[nodiscard]] bool pop(T &data_out) noexcept {
+    [[nodiscard]] std::size_t pop_batch (T* data_array_out, std::size_t count) noexcept {
         std::size_t current_read = m_read_ptr.load(std::memory_order_relaxed);
-        std::size_t current_write = m_write_ptr.load(std::memory_order_acquire);     //Acquire write ptr state
-        
-        if (current_read == current_write) [[unlikely]] {
-            return false;
+        std::size_t current_write = m_write_ptr.load(std::memory_order_acquire);
+
+        std::size_t available = current_write - current_read;
+        std::size_t item_to_read = (count < available) ? count : available;
+
+        if (item_to_read == 0) [[unlikely]] return 0;
+
+        for (std::size_t i=0; i<item_to_read; ++i) {
+        data_array_out[i] = m_buffer[(current_read + i) & MASK];
         }
 
-        data_out = m_buffer[current_read & MASK];
-        m_read_ptr.store(current_read + 1, std::memory_order_release);
-        return true;
+        m_read_ptr.store(current_read + item_to_read, std::memory_order_release);
+
+        return item_to_read;
     }
 
     [[nodiscard]] bool is_empty() const noexcept {
