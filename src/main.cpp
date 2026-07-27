@@ -82,27 +82,55 @@ void run_network_producer() noexcept {
 
     marketUpdate_aligned network_batch_packets[batch_size];
 
-    while (market_open.load(std::memory_order_relaxed)) {
+    while (hold.load(std::memory_order_relaxed)) {
         asm volatile ("pause" ::: "memory");
     }
 
-    std::cout << "===---Blasting 8 test ticks into the span boundary...---===\n";
-    for (std::size_t i = 0; i < 8; ++i) {
+    std::cout << "===---Ingesting Continuous Market Stream...---===\n";
+
+    std::size_t total_processed = 0;
+    std::size_t local_batch_index = 0;
+    const std::size_t MAX_TICKS = 10'000'000;
+
+    while (total_processed < MAX_TICKS) {
         
-        uint32_t price = 25000 + (i*200);
-        uint32_t quantity = 100 + (i*1000);
-        char side = (i % 2 == 0) ? 'B' : 'S';
+        uint32_t price = 25000 + (total_processed*2);
+        uint32_t quantity = 100 + (total_processed*2);
+        char side = (total_processed % 2 == 0) ? 'B' : 'S';
 
         std::memcpy (&mock_socket_buffer[0], "NIFTY50\0", 8);
         std::memcpy (&mock_socket_buffer[8], &price, 4);
         std::memcpy (&mock_socket_buffer[12], &quantity, 4);
         std::memcpy (&mock_socket_buffer[16], &side, 1);
 
-        network_batch_packets[i] = handle_incoming_network_bytes(mock_socket_buffer);
+        network_batch_packets[local_batch_index] = handle_incoming_network_bytes(mock_socket_buffer);
+
+        total_processed++;
+        local_batch_index++;
+
+        if (local_batch_index == batch_size) {
+            std::size_t pushed_count = 0;
+
+            while (pushed_count == 0) {
+                pushed_count = transport_ring.push_batch(network_batch_packets, batch_size);
+
+                if (pushed_count == 0) {
+                    asm volatile ("pause" ::: "memory");
+                }
+            }
+
+            local_batch_index = 0;   //reset
+        }
+
+
 
     }
 
-    std::size_t pushed_count = transport_ring.push_batch(network_batch_packets, batch_size);
+    if (local_batch_index > 0) {
+        while(transport_ring.push_batch(network_batch_packets, local_batch_index) == 0) {
+            asm volatile ("pause" ::: "memory");
+        }
+    }
 
 }
 
