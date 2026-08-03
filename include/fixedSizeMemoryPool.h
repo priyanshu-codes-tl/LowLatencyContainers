@@ -73,6 +73,21 @@ class fixedSizeMemoryPool {
         
     }
 
+    [[nodiscard]] uint32_t get_index_from_ptr (T* ptr) {
+        if (ptr == nullptr) return 0xFFFFFFFF;
+
+        node* target = reinterpret_cast<node*>(ptr);
+        uint32_t index = static_cast<uint32_t>(target - m_storage);
+
+        return index;
+    }
+
+    [[nodiscard]] T* get_ptr_from_index (uint32_t idx) {
+        if (idx == 0xFFFFFFFF) return nullptr;
+
+        return reinterpret_cast<T*>(m_storage[idx].data);
+    }
+
 };   
 
 #endif

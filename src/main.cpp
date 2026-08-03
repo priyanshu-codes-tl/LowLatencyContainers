@@ -15,10 +15,13 @@
 alignas(64) std::atomic<bool> market_open{true};
 alignas(64) std::atomic<bool> hold{true};
 
+static constexpr uint32_t NULL_IDX = 0xFFFFFFFF;
+
 #pragma pack(push, 1)
 struct marketUpdate {
     std::array<char, 8> symbol;
-    uint32_t price;
+    uint64_t order_id;
+    uint32_t price_tick;
     uint32_t quantity;
     char side;
 };
@@ -26,19 +29,41 @@ struct marketUpdate {
 
 struct marketUpdate_aligned {
     std::array<char, 8> symbol;
-    uint32_t price;
+    uint64_t order_id;
+    uint32_t price_tick;
     uint32_t quantity;
     char side;
 
     marketUpdate_aligned() = default;
 
-    marketUpdate_aligned (const std::array<char, 8>& sym, uint32_t p, uint32_t q, char s) : symbol(sym), price(p), quantity(q), side(s) {}
+    marketUpdate_aligned (const std::array<char, 8>& sym, uint64_t oid, uint32_t p, uint32_t q, char s) : symbol(sym), order_id(oid), price_tick(p), quantity(q), side(s) {}
 };
+
+struct order_node {
+    uint64_t order_id;
+    uint32_t price_ticks;
+    uint32_t quantity;
+
+    uint32_t prev_idx{NULL_IDX};
+    uint32_t next_idx{NULL_IDX};
+};
+
+struct price_level {
+    uint32_t volume{0};
+    
+    uint32_t head_idx{NULL_IDX};
+    uint32_t tail_idx{NULL_IDX};
+};
+
+//Order Buffer
+fixedSizeMemoryPool<order_node, 100000> order_pool;
+//Price Level Buffer
+std::array<price_level, 1000000> bid_levels;
+
 
 //Ring Buffer
 lockFreeRingBuffer <marketUpdate_aligned, 512> transport_ring;
-//Memory Pool
-fixedSizeMemoryPool <marketUpdate_aligned, 11000> execution_vault;
+
 
 //For pinning thread to cpu core
 void pin_thread (int core, std::string thread_name) noexcept {
@@ -58,6 +83,98 @@ void pin_thread (int core, std::string thread_name) noexcept {
     }
 }
 
+void add_new_order(uint64_t order_id, uint32_t price_tick, uint32_t quantity) {
+    order_node* new_order_ptr = order_pool.allocate();
+
+    if (new_order_ptr == nullptr) [[unlikely]] return;
+
+    new_order_ptr->order_id = order_id;
+    new_order_ptr->price_ticks = price_tick;
+    new_order_ptr->quantity = quantity;
+
+    new_order_ptr->prev_idx = NULL_IDX;
+    new_order_ptr->next_idx = NULL_IDX;
+
+    uint32_t new_room_index = order_pool.get_index_from_ptr(new_order_ptr);
+
+    price_level& level = bid_levels[price_tick];
+
+    if(level.head_idx == NULL_IDX) {
+        level.head_idx = new_room_index;
+        level.tail_idx = new_room_index;
+    } else {
+        new_order_ptr->prev_idx = level.tail_idx;
+
+        order_node* prev_order_ptr = order_pool.get_ptr_from_index(level.tail_idx);
+
+        prev_order_ptr->next_idx = new_room_index;
+
+        level.tail_idx = new_room_index;
+    }
+
+    level.volume += quantity;
+}
+
+void cancel_order (uint32_t target_idx, uint32_t price_tick) {
+    order_node* target_order = order_pool.get_ptr_from_index(target_idx);
+    price_level& level = bid_levels[price_tick];
+    
+    if(target_order->prev_idx != NULL_IDX) {
+        order_node* prev_order = order_pool.get_ptr_from_index(target_order->prev_idx);
+        prev_order->next_idx = target_order->next_idx;
+    } else {
+        level.head_idx = target_order->next_idx;
+    }
+
+    if(target_order->next_idx != NULL_IDX) {
+        order_node* next_order = order_pool.get_ptr_from_index(target_order->next_idx);
+        next_order->prev_idx = target_order->prev_idx;
+    } else {
+        level.tail_idx = target_order->prev_idx;
+    }
+
+    level.volume -= target_order->quantity;
+
+    order_pool.deallocate(target_order);
+}
+
+[[nodiscard]] uint32_t execute_aggressive_sell (uint32_t sell_quantity, uint32_t target_price_tick) {
+    price_level& level = bid_levels[static_cast<std::size_t>(target_price_tick)];
+    
+    while (sell_quantity>0 && level.head_idx != NULL_IDX) {
+        order_node* head_order = order_pool.get_ptr_from_index(level.head_idx);
+        uint32_t buy_quantity = head_order->quantity;
+
+        if(buy_quantity <= sell_quantity) {
+            sell_quantity -= buy_quantity;
+            level.volume -= buy_quantity;
+
+            std::cout << "[TRADE] " << buy_quantity << " shares at Tick " 
+                      << target_price_tick << ". Walking chain...\n";
+
+            level.head_idx = head_order->next_idx;
+
+            if(level.head_idx != NULL_IDX) {
+                order_node* new_head_order = order_pool.get_ptr_from_index(level.head_idx);
+                new_head_order->prev_idx = NULL_IDX;
+            } else [[unlikely]] {
+                level.tail_idx = NULL_IDX;
+            }
+            
+            order_pool.deallocate(head_order);
+        } else {
+            head_order->quantity -= sell_quantity;
+            level.volume -= sell_quantity;
+            sell_quantity = 0;
+
+            std::cout << "[TRADE] " << sell_quantity << " shares at Tick " 
+                      << target_price_tick << ". Seller exhausted.\n";
+        }
+    }
+
+    return sell_quantity;
+}
+
 // ---The Network Producer---
 marketUpdate_aligned handle_incoming_network_bytes (std::span<const char> rawNetworkBuffer) noexcept{
 
@@ -67,7 +184,7 @@ marketUpdate_aligned handle_incoming_network_bytes (std::span<const char> rawNet
 
     const auto* net_pkt = reinterpret_cast<const marketUpdate*>(rawNetworkBuffer.data());
 
-    marketUpdate_aligned update(net_pkt->symbol, net_pkt->price, net_pkt->quantity, net_pkt->side);
+    marketUpdate_aligned update(net_pkt->symbol, net_pkt->order_id, net_pkt->price_tick, net_pkt->quantity, net_pkt->side);
 
     return update;    
 }
@@ -88,20 +205,26 @@ void run_network_producer() noexcept {
 
     std::cout << "===---Ingesting Continuous Market Stream...---===\n";
 
+    uint32_t price_tick = 139;
     std::size_t total_processed = 0;
     std::size_t local_batch_index = 0;
     const std::size_t MAX_TICKS = 10'000'000;
 
     while (total_processed < MAX_TICKS) {
-        
-        uint32_t price = 25000 + (total_processed*2);
+        uint64_t order_id = 523456780 + total_processed;
+        if (price_tick<200) {
+            price_tick++;
+        } else {
+            price_tick = 139;
+        }
         uint32_t quantity = 100 + (total_processed*2);
-        char side = (total_processed % 2 == 0) ? 'B' : 'S';
+        char side = (total_processed % 12 == 0) ? 'B' : 'S';
 
         std::memcpy (&mock_socket_buffer[0], "NIFTY50\0", 8);
-        std::memcpy (&mock_socket_buffer[8], &price, 4);
-        std::memcpy (&mock_socket_buffer[12], &quantity, 4);
-        std::memcpy (&mock_socket_buffer[16], &side, 1);
+        std::memcpy (&mock_socket_buffer[8], &order_id, 8);
+        std::memcpy (&mock_socket_buffer[16], &price_tick, 4);
+        std::memcpy (&mock_socket_buffer[20], &quantity, 4);
+        std::memcpy (&mock_socket_buffer[24], &side, 1);
 
         network_batch_packets[local_batch_index] = handle_incoming_network_bytes(mock_socket_buffer);
 
@@ -121,9 +244,6 @@ void run_network_producer() noexcept {
 
             local_batch_index = 0;   //reset
         }
-
-
-
     }
 
     if (local_batch_index > 0) {
@@ -145,23 +265,31 @@ void run_strategy_consumer () noexcept {
         std::size_t popped_count = transport_ring.pop_batch(local_batch_packet, batch_size);
         if(popped_count > 0) {
             for (std::size_t i=0; i<popped_count; ++i) {
-            if (local_batch_packet[i].side == 'B' && local_batch_packet[i].price > 25500) {
-                marketUpdate_aligned* savedSignal = execution_vault.allocate(local_batch_packet[i].symbol, 
-                                                                             local_batch_packet[i].price, 
-                                                                             local_batch_packet[i].quantity, 
-                                                                             local_batch_packet[i].side);
+                if (local_batch_packet[i].side == 'B') {
+                    add_new_order(local_batch_packet[i].order_id,
+                                  local_batch_packet[i].price_tick,
+                                  local_batch_packet[i].quantity);
 
-                if (savedSignal != nullptr) {
-                    std::cout << "[STRATEGY MATCH] Vaulted Signal for " 
-                              << std::string_view(savedSignal->symbol.data(), savedSignal->symbol.size()) 
-                              << " | Price: " << savedSignal->price 
-                              << " | Qty: " << savedSignal->quantity << "\n";
+                    uint32_t current_tick = local_batch_packet[i].price_tick;
+                    std::cout << "[LOB UPDATE] Buy Order ID " << local_batch_packet[i].order_id 
+                              << " added. Total Volume at Tick " << current_tick 
+                              << ": " << bid_levels[current_tick].volume << "\n";
                 }
-            }
-        }
 
-        }
-        else {
+                if (local_batch_packet[i].side == 'S') {
+                    
+                    local_batch_packet[i].quantity = execute_aggressive_sell(local_batch_packet[i].quantity, 
+                                                                             local_batch_packet[i].price_tick);
+    
+                // 2. Log the leftover volume (Soon, this will be pushed to the Ask book)
+                    if (local_batch_packet[i].quantity > 0) {
+                        std::cout << "[MARKET ALERT] Sell Order ID " << local_batch_packet[i].order_id 
+                                    << " has " << local_batch_packet[i].quantity 
+                                    << " shares leftover. (Awaiting Ask Book Implementation)\n";
+                    }
+                }
+            } 
+        } else {
             asm volatile ("pause" ::: "memory");
         }
     }
