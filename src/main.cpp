@@ -11,6 +11,11 @@
 #include <span>
 #include <chrono>
 #include <pthread.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <endian.h>
 
 alignas(64) std::atomic<bool> market_open{true};
 alignas(64) std::atomic<bool> hold{true};
@@ -118,9 +123,9 @@ void add_new_order(uint64_t order_id, uint32_t price_tick, uint32_t quantity, ch
     level.volume += quantity;
 
     if(side=='B') {
-        if(best_bid > price_tick) best_bid = price_tick;
+        if(best_bid < price_tick) best_bid = price_tick;
     } else {
-        if(best_ask < price_tick) best_ask = price_tick;
+        if(best_ask > price_tick) best_ask = price_tick;
     }
 }
 
@@ -254,7 +259,7 @@ void cancel_order (uint32_t target_idx, uint32_t price_tick) {
 }
 
 // ---The Network Producer---
-marketUpdate_aligned handle_incoming_network_bytes (std::span<const char> rawNetworkBuffer) noexcept{
+marketUpdate_aligned handle_incoming_network_bytes (std::span<const char> rawNetworkBuffer) noexcept {
 
     if (rawNetworkBuffer.size() < sizeof(marketUpdate)) [[unlikely]] {
         return {};
@@ -262,7 +267,15 @@ marketUpdate_aligned handle_incoming_network_bytes (std::span<const char> rawNet
 
     const auto* net_pkt = reinterpret_cast<const marketUpdate*>(rawNetworkBuffer.data());
 
-    marketUpdate_aligned update(net_pkt->symbol, net_pkt->order_id, net_pkt->price_tick, net_pkt->quantity, net_pkt->side);
+    uint64_t safe_order_id = be64toh(net_pkt->order_id);
+    uint32_t safe_price = ntohl(net_pkt->price_tick);
+    uint32_t safe_quantity = ntohl(net_pkt->quantity);
+
+    marketUpdate_aligned update(net_pkt->symbol,
+                                safe_order_id,
+                                safe_price,
+                                safe_quantity,
+                                net_pkt->side);
 
     return update;    
 }
@@ -270,66 +283,53 @@ marketUpdate_aligned handle_incoming_network_bytes (std::span<const char> rawNet
 void run_network_producer() noexcept {
     pin_thread(4, "producer thread");
 
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if(sock < 0) return;
+
+    sockaddr_in local_addr{};
+    local_addr.sin_family = AF_INET;
+    local_addr.sin_port = htons(12345);
+    local_addr.sin_addr.s_addr = INADDR_ANY;
+    bind(sock, reinterpret_cast<struct sockaddr*>(&local_addr), sizeof(local_addr));
+
+    ip_mreq group{};
+    group.imr_multiaddr.s_addr = inet_addr("239.255.0.1");
+    group.imr_interface.s_addr = INADDR_ANY;
+    setsockopt(sock, IPPROTO_IP, IP_ADD_MEMBERSHIP, &group, sizeof(group));
+
+    alignas(64) char network_buffer[2048];
+
+
     constexpr std::size_t batch_size = 8;
-
-    //Allocate a raw C-style buffer to act as our virtual incoming network interface card
-    char mock_socket_buffer[sizeof(marketUpdate)];
-
     marketUpdate_aligned network_batch_packets[batch_size];
+    std::size_t local_batch_index = 0;
 
     while (hold.load(std::memory_order_relaxed)) {
         asm volatile ("pause" ::: "memory");
     }
 
-    std::cout << "===---Ingesting Continuous Market Stream...---===\n";
+    std::cout << "===---Listening to Live UDP Multicast Stream...---===\n";
 
-    uint32_t price_tick = 13905;
-    std::size_t total_processed = 0;
-    std::size_t local_batch_index = 0;
-    const std::size_t MAX_TICKS = 10'000'000;
+    while (market_open.load(std::memory_order_relaxed)) {
+        ssize_t bytes_received = recvfrom(sock, network_buffer, sizeof(network_buffer), 0, nullptr, nullptr);
 
-    while (total_processed < MAX_TICKS) {
-        uint64_t order_id = 523456780 + total_processed;
-        if (price_tick<20000) {
-            price_tick += 5;
-        } else {
-            price_tick = 13905;
-        }
-        uint32_t quantity = 100 + (total_processed*2);
-        char side = (total_processed % 8 == 0) ? 'B' : 'S';
+        if(bytes_received >= sizeof(marketUpdate)) {
+            std::span<const char> raw_span(network_buffer, bytes_received);
+            network_batch_packets[local_batch_index] = handle_incoming_network_bytes(raw_span);
+            local_batch_index++;
 
-        std::memcpy (&mock_socket_buffer[0], "NIFTY50\0", 8);
-        std::memcpy (&mock_socket_buffer[8], &order_id, 8);
-        std::memcpy (&mock_socket_buffer[16], &price_tick, 4);
-        std::memcpy (&mock_socket_buffer[20], &quantity, 4);
-        std::memcpy (&mock_socket_buffer[24], &side, 1);
-
-        network_batch_packets[local_batch_index] = handle_incoming_network_bytes(mock_socket_buffer);
-
-        total_processed++;
-        local_batch_index++;
-
-        if (local_batch_index == batch_size) {
-            std::size_t pushed_count = 0;
-
-            while (pushed_count == 0) {
-                pushed_count = transport_ring.push_batch(network_batch_packets, batch_size);
-
-                if (pushed_count == 0) {
+            if(local_batch_index == batch_size) {
+                while(transport_ring.push_batch(network_batch_packets, batch_size) == 0) {
                     asm volatile ("pause" ::: "memory");
                 }
+
+                local_batch_index = 0;
             }
 
-            local_batch_index = 0;   //reset
         }
     }
 
-    if (local_batch_index > 0) {
-        while(transport_ring.push_batch(network_batch_packets, local_batch_index) == 0) {
-            asm volatile ("pause" ::: "memory");
-        }
-    }
-
+    close(sock);
 }
 
 // ---The Strategy Consumer---
@@ -353,10 +353,10 @@ void run_strategy_consumer () noexcept {
                                     'B');
                     }
                     
-                /*  uint32_t current_tick = local_batch_packet[i].price_tick;
+                  uint32_t current_tick = local_batch_packet[i].price_tick;
                     std::cout << "[LOB UPDATE] Buy Order ID " << local_batch_packet[i].order_id 
                               << " added. Total Volume at Tick " << current_tick 
-                              << ": " << bid_levels[current_tick].volume << "\n"; */
+                              << ": " << bid_levels[current_tick].volume << "\n"; 
                 }
 
                 if (local_batch_packet[i].side == 'S') {
@@ -370,11 +370,11 @@ void run_strategy_consumer () noexcept {
                     }
     
                 // 2. Log the leftover volume (Soon, this will be pushed to the Ask book)
-                /*    if (local_batch_packet[i].quantity > 0) {
+                    if (local_batch_packet[i].quantity > 0) {
                         std::cout << "[MARKET ALERT] Sell Order ID " << local_batch_packet[i].order_id 
                                     << " has " << local_batch_packet[i].quantity 
                                     << " shares leftover. (Awaiting Ask Book Implementation)\n";
-                    }  */
+                    }  
                 }
             } 
         } else {
